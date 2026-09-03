@@ -98,7 +98,9 @@ function queueMessageProcessing(senderPsid, text, attachments) {
     try {
       await processChatWithGemini(senderPsid, combinedText, combinedAttachments);
     } catch (error) {
-      console.error("Loi xu ly AI:", error.message);
+      console.error("Loi xu ly AI:", error.message || error);
+      await sendSenderAction(senderPsid, "typing_off");
+      await sendFbMessage(senderPsid, { text: "Xin lỗi bạn, hệ thống đang bận hoặc gặp lỗi kết nối. Bạn vui lòng thử lại sau nhé! 🌸" });
     }
   }, 2500);
 }
