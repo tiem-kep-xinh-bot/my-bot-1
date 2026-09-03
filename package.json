@@ -1,0 +1,17 @@
+{
+  "name": "fanpage-gemini-bot",
+  "version": "1.0.0",
+  "description": "Chatbot tu van ban kep toc tren Meta Messenger tich hop Gemini 3.6 Flash va Google Sheets",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "express": "^4.19.0",
+    "localtunnel": "^2.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
