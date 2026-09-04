@@ -9,7 +9,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "MY_VERIFY_TOKEN_123";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SHEET_CSV_URL = process.env.SHEET_CSV_URL;
 const PORT = process.env.PORT || 3000;
-const GEMINI_MODEL = "gemini-2.0-flash";
+const GEMINI_MODEL = "gemini-3.6-flash";
 const GEMINI_TIMEOUT_MS = 30000; // 30 giay timeout cho Gemini API
 const MAX_RETRIES = 2; // So lan thu lai khi bi rate-limit
 
