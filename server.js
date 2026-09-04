@@ -9,6 +9,9 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "MY_VERIFY_TOKEN_123";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SHEET_CSV_URL = process.env.SHEET_CSV_URL;
 const PORT = process.env.PORT || 3000;
+const GEMINI_MODEL = "gemini-2.0-flash";
+const GEMINI_TIMEOUT_MS = 30000; // 30 giay timeout cho Gemini API
+const MAX_RETRIES = 2; // So lan thu lai khi bi rate-limit
 
 let productCatalogCache = "";
 let lastCatalogFetchTime = 0;
@@ -98,7 +101,8 @@ function queueMessageProcessing(senderPsid, text, attachments) {
     try {
       await processChatWithGemini(senderPsid, combinedText, combinedAttachments);
     } catch (error) {
-      console.error("Loi xu ly AI:", error.message || error);
+      const errDetail = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+      console.error(`[Gemini Error] PSID=${senderPsid} | Status=${error.response?.status || 'N/A'} | Detail: ${errDetail}`);
       await sendSenderAction(senderPsid, "typing_off");
       await sendFbMessage(senderPsid, { text: "Xin lỗi bạn, hệ thống đang bận hoặc gặp lỗi kết nối. Bạn vui lòng thử lại sau nhé! 🌸" });
     }
@@ -109,15 +113,35 @@ async function getCatalog() {
   const now = Date.now();
   if (!productCatalogCache || now - lastCatalogFetchTime > 5 * 60 * 1000) {
     try {
-      const res = await axios.get(SHEET_CSV_URL);
+      const res = await axios.get(SHEET_CSV_URL, { timeout: 10000 });
       productCatalogCache = res.data;
       lastCatalogFetchTime = now;
-      console.log("Da cap nhat cache tu Google Sheets.");
+      console.log("[Catalog] Da cap nhat cache tu Google Sheets.");
     } catch (err) {
-      console.error("Khong tai duoc du lieu Sheet:", err.message);
+      console.error("[Catalog] Khong tai duoc du lieu Sheet:", err.message);
     }
   }
   return productCatalogCache;
+}
+
+async function callGeminiWithRetry(payload, retries = MAX_RETRIES) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await axios.post(url, payload, { timeout: GEMINI_TIMEOUT_MS });
+      return response;
+    } catch (err) {
+      const status = err.response?.status;
+      // Retry chi khi bi rate-limit (429) hoac server error (500, 503)
+      if ((status === 429 || status >= 500) && attempt < retries) {
+        const waitMs = Math.min(1000 * Math.pow(2, attempt), 8000); // 1s, 2s, 4s, max 8s
+        console.log(`[Gemini Retry] Attempt ${attempt + 1}/${retries} - Status ${status} - Wait ${waitMs}ms`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+        continue;
+      }
+      throw err; // Re-throw neu het retry hoac loi khac
+    }
+  }
 }
 
 async function processChatWithGemini(senderPsid, text, attachments) {
@@ -129,7 +153,7 @@ async function processChatWithGemini(senderPsid, text, attachments) {
   for (const item of attachments) {
     if (item.type === "image" && item.payload && item.payload.url) {
       try {
-        const imgRes = await axios.get(item.payload.url, { responseType: "arraybuffer" });
+        const imgRes = await axios.get(item.payload.url, { responseType: "arraybuffer", timeout: 10000 });
         userParts.push({
           inlineData: {
             data: Buffer.from(imgRes.data).toString("base64"),
@@ -138,7 +162,7 @@ async function processChatWithGemini(senderPsid, text, attachments) {
         });
         userParts.push({ text: "(Khach gui kem anh, doi chieu voi danh muc de tu van)" });
       } catch (err) {
-        console.error("Loi tai anh:", err.message);
+        console.error("[Image] Loi tai anh:", err.message);
       }
     }
   }
@@ -152,7 +176,6 @@ async function processChatWithGemini(senderPsid, text, attachments) {
   if (history.length > 8) history = history.slice(-8);
 
   const systemInstruction = {
-    role: "system",
     parts: [{
       text: `Ban la tro ly tu van ban kep toc nhiet tinh, duyen dang cua tiem "Kep Xinh".
 Xung ho: Em - Chi. Dung emoji dang yeu (🌸, ✨, 🎀).
@@ -165,15 +188,18 @@ Nguyen tac:
     }]
   };
 
-  const geminiResponse = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      contents: history,
-      systemInstruction: systemInstruction
-    }
-  );
+  const geminiResponse = await callGeminiWithRetry({
+    contents: history,
+    system_instruction: systemInstruction
+  });
 
-  const replyText = geminiResponse.data.candidates[0].content.parts[0].text;
+  const candidates = geminiResponse.data.candidates;
+  if (!candidates || candidates.length === 0 || !candidates[0].content) {
+    console.error("[Gemini] Khong co candidates hop le:", JSON.stringify(geminiResponse.data));
+    throw new Error("Gemini returned no valid candidates");
+  }
+
+  const replyText = candidates[0].content.parts[0].text;
   history.push({ role: "model", parts: [{ text: replyText }] });
   conversationHistory.set(senderPsid, { messages: history, lastUpdated: Date.now() });
 
@@ -181,7 +207,9 @@ Nguyen tac:
   const cleanText = replyText.replace(/\[IMAGE:\s*(https?:\/\/[^\]]+)\]/g, "").trim();
 
   await sendSenderAction(senderPsid, "typing_off");
-  await sendFbMessage(senderPsid, { text: cleanText });
+  if (cleanText) {
+    await sendFbMessage(senderPsid, { text: cleanText });
+  }
 
   if (imageMatch && imageMatch[1]) {
     await sendFbMessage(senderPsid, {
