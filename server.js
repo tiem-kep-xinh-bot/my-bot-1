@@ -10,8 +10,8 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SHEET_CSV_URL = process.env.SHEET_CSV_URL;
 const PORT = process.env.PORT || 3000;
 const GEMINI_MODEL = "gemini-3.6-flash";
-const GEMINI_TIMEOUT_MS = 30000; // 30 giay timeout cho Gemini API
-const MAX_RETRIES = 2; // So lan thu lai khi bi rate-limit
+const GEMINI_TIMEOUT_MS = 60000; // 60 giay timeout cho Gemini API (free tier co the cham)
+const MAX_RETRIES = 3; // So lan thu lai khi bi rate-limit hoac server error
 
 let productCatalogCache = "";
 let lastCatalogFetchTime = 0;
@@ -134,7 +134,7 @@ async function callGeminiWithRetry(payload, retries = MAX_RETRIES) {
       const status = err.response?.status;
       // Retry chi khi bi rate-limit (429) hoac server error (500, 503)
       if ((status === 429 || status >= 500) && attempt < retries) {
-        const waitMs = Math.min(1000 * Math.pow(2, attempt), 8000); // 1s, 2s, 4s, max 8s
+        const waitMs = Math.min(2000 * Math.pow(2, attempt), 15000); // 2s, 4s, 8s, max 15s
         console.log(`[Gemini Retry] Attempt ${attempt + 1}/${retries} - Status ${status} - Wait ${waitMs}ms`);
         await new Promise(resolve => setTimeout(resolve, waitMs));
         continue;
