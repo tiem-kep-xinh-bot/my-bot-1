@@ -30,11 +30,8 @@ async function appendOrderToSheet(orderData) {
   // Luon luu ban copy cuc bo truoc de tranh mat don
   saveBackupLocally(orderData);
 
-  const webhookUrl = process.env.ORDER_SHEET_WEBHOOK_URL;
-  if (!webhookUrl) {
-    console.warn("[Sheet Service] Chua cau hinh ORDER_SHEET_WEBHOOK_URL trong .env. Don hang da duoc luu tam vao orders_backup.json");
-    return { success: false, reason: "NO_WEBHOOK_URL", orderCode: orderData.orderCode };
-  }
+  const DEFAULT_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyI5pSu7mi1w5lO1meAc-WVzE6_TdHkGiDr1ykF4qOGNiJaVtUY9p15i5xW1hp8sTpf/exec";
+  const webhookUrl = (process.env.ORDER_SHEET_WEBHOOK_URL && process.env.ORDER_SHEET_WEBHOOK_URL.trim()) || DEFAULT_WEBHOOK_URL;
 
   try {
     console.log(`[Sheet Service] Dang gui don hang ${orderData.orderCode} len Google Sheets...`);
