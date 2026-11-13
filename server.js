@@ -1,43 +1,217 @@
+// Tu dong nap file .env neu chua co trong bien moi truong
+const fs = require("fs");
+const path = require("path");
+
+function loadEnv() {
+  const envPath = path.join(__dirname, ".env");
+  if (fs.existsSync(envPath)) {
+    const lines = fs.readFileSync(envPath, "utf8").split("\n");
+    for (const line of lines) {
+      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+      if (match) {
+        const key = match[1];
+        let value = (match[2] || "").trim();
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        if (!process.env[key]) {
+          process.env[key] = value;
+        }
+      }
+    }
+  }
+}
+loadEnv();
+
 const express = require("express");
 const axios = require("axios");
+const { extractOrderFromConversation } = require("./services/geminiExtractor");
+const { appendOrderToSheet } = require("./services/sheetService");
 
 const app = express();
 app.use(express.json());
 
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "MY_VERIFY_TOKEN_123";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const SHEET_CSV_URL = process.env.SHEET_CSV_URL;
 const PORT = process.env.PORT || 3000;
-const GEMINI_MODEL = "gemini-3.6-flash";
-const GEMINI_TIMEOUT_MS = 60000; // 60 giay timeout cho Gemini API (free tier co the cham)
-const MAX_RETRIES = 3; // So lan thu lai khi bi rate-limit hoac server error
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "MY_VERIFY_TOKEN_123";
+const SHEET_CSV_URL = process.env.SHEET_CSV_URL;
 
+// Luu tru lich su hoi thoai trong bo nho (toi da 15 tin nhan gan nhat moi khach)
+// Key: customerPsid, Value: [{ sender: "Khách hàng" | "Shop", text: string, timestamp: number }]
+const conversationHistory = new Map();
+
+// Timer gom tin nhan de tu dong phan tich (debounce)
+const autoTriggerTimers = new Map();
+
+// Danh sach don hang vua len de chong trung lap (khoa trong 15 phut)
+// Key: customerPsid, Value: { orderCode: string, timestamp: number }
+const recentOrders = new Map();
+
+// Cache danh muc san pham tu Google Sheets (neu co)
 let productCatalogCache = "";
 let lastCatalogFetchTime = 0;
 
-const conversationHistory = new Map();
-const messageBuffers = new Map();
-const humanTakeoverMap = new Map();
+/**
+ * Lay danh muc san pham de Gemini doi chieu
+ */
+async function getCatalog() {
+  if (!SHEET_CSV_URL) return "";
+  const now = Date.now();
+  if (!productCatalogCache || now - lastCatalogFetchTime > 10 * 60 * 1000) {
+    try {
+      const res = await axios.get(SHEET_CSV_URL, { timeout: 10000 });
+      productCatalogCache = res.data;
+      lastCatalogFetchTime = now;
+      console.log("[Catalog] Da cap nhat cache danh muc san pham.");
+    } catch (err) {
+      console.warn("[Catalog] Khong tai duoc Sheet danh muc:", err.message);
+    }
+  }
+  return productCatalogCache;
+}
 
+/**
+ * Ghi nhan tin nhan vao lich su cuoc tro chuyen
+ */
+function recordMessage(customerPsid, sender, text) {
+  if (!text || !text.trim()) return;
+
+  if (!conversationHistory.has(customerPsid)) {
+    conversationHistory.set(customerPsid, []);
+  }
+
+  const history = conversationHistory.get(customerPsid);
+  history.push({
+    sender: sender,
+    text: text.trim(),
+    timestamp: Date.now()
+  });
+
+  // Chi giu toi da 15 tin nhan gan nhat
+  if (history.length > 15) {
+    history.shift();
+  }
+}
+
+/**
+ * Kiem tra tin nhan co chua so dien thoai va tu khoa dia chi khong
+ */
+function containsPhoneAndAddress(customerPsid) {
+  const history = conversationHistory.get(customerPsid) || [];
+  // Gom noi dung cac tin nhan gan nhat tu phia khach hang
+  const customerTexts = history
+    .filter(m => m.sender === "Khách hàng")
+    .slice(-4)
+    .map(m => m.text)
+    .join(" ");
+
+  // Regex tim so dien thoai VN (10 so bat dau bang 0 hoac +84)
+  const phoneRegex = /(?:0|\+84)(?:3[2-9]|5[2689]|7[06-9]|8[1-9]|9\d)\d{7}\b/;
+  // Regex tim tu khoa dia chi
+  const addressRegex = /(phường|xã|quận|huyện|tỉnh|thành phố|\btp\b|đường|ngõ|ngách|thôn|ấp|xóm|số nhà|toà|tòa|chung cư|kđt|p\.|q\.)/i;
+
+  return phoneRegex.test(customerTexts) && addressRegex.test(customerTexts);
+}
+
+/**
+ * Xu ly tao don hang tu doan hoi thoai
+ */
+async function processOrderCreation(customerPsid, triggerType, force = false) {
+  // Kiem tra chong trung lap: Neu vua len don trong 15 phut va khong phai lenh #chot bat buoc
+  const lastOrder = recentOrders.get(customerPsid);
+  if (!force && lastOrder && (Date.now() - lastOrder.timestamp < 15 * 60 * 1000)) {
+    console.log(`[Order Ignored] Khach ${customerPsid} vua duoc len don ${lastOrder.orderCode}. Bo qua de tranh trung don.`);
+    return;
+  }
+
+  const history = conversationHistory.get(customerPsid) || [];
+  if (history.length === 0) {
+    console.log(`[Order Extractor] Khong co tin nhan de trich xuat cho ${customerPsid}`);
+    return;
+  }
+
+  console.log(`\n--------------------------------------------------`);
+  console.log(`[Order Processing] Kich hoat boi: ${triggerType} cho khach PSID: ${customerPsid}`);
+  console.log(`Dang phan tich ${history.length} tin nhan gan nhat qua Gemini...`);
+
+  const catalog = await getCatalog();
+  const extracted = await extractOrderFromConversation(history, catalog);
+
+  if (!extracted || !extracted.has_valid_order) {
+    if (force) {
+      console.log(`[Lệnh #chot] Chưa đủ thông tin cần thiết (cần tối thiểu SĐT, Địa chỉ, Sản phẩm).`);
+    } else {
+      console.log(`[Auto Detect] Chưa đủ điều kiện tạo đơn (chưa có đủ SĐT/Địa chỉ/Sản phẩm).`);
+    }
+    return;
+  }
+
+  // Tao ma don hang rieng cua shop: TKX_YYMMDD_XXX
+  const now = new Date();
+  const dateStr = now.toISOString().slice(2, 10).replace(/-/g, "");
+  const randomSuffix = Math.floor(100 + Math.random() * 900);
+  const orderCode = `TKX_${dateStr}_${randomSuffix}`;
+
+  const orderData = {
+    orderCode: orderCode,
+    customerName: extracted.customer_name || "Khách Facebook",
+    phone: extracted.phone || "",
+    province: extracted.province || "",
+    district: extracted.district || "",
+    ward: extracted.ward || "",
+    addressDetail: extracted.address_detail || "",
+    productName: extracted.product_name || "Kẹp tóc",
+    weight: extracted.weight || 150,
+    codAmount: extracted.cod_amount || 0,
+    itemValue: extracted.cod_amount || 0,
+    note: extracted.note || "Cho xem hàng, không cho thử",
+    createdAt: now.toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" }),
+    psid: customerPsid
+  };
+
+  console.log(`==================================================`);
+  console.log(`🎉 [ĐƠN HÀNG MỚI ĐÃ ĐƯỢC BẮT ĐẦU TẠO]`);
+  console.log(`- Mã đơn:    ${orderData.orderCode}`);
+  console.log(`- Tên khách: ${orderData.customerName}`);
+  console.log(`- SĐT:       ${orderData.phone}`);
+  console.log(`- Địa chỉ:   ${orderData.addressDetail}, ${orderData.ward}, ${orderData.district}, ${orderData.province}`);
+  console.log(`- Sản phẩm:  ${orderData.productName}`);
+  console.log(`- Tiền COD:  ${orderData.codAmount.toLocaleString("vi-VN")} đ`);
+  console.log(`- Ghi chú:   ${orderData.note}`);
+  console.log(`==================================================`);
+
+  // Ghi vao Google Sheets va file luu tru du phong
+  await appendOrderToSheet(orderData);
+
+  // Danh dau da len don de tranh trung
+  recentOrders.set(customerPsid, {
+    orderCode: orderCode,
+    timestamp: Date.now()
+  });
+
+  // CHE DO IM LANG (Option 2): Khong gui bat ky tin nhan nao ra Messenger
+  console.log(`[Silent Mode] He thong giu im lang tren Messenger, cuoc tro chuyen giua khach va shop dien ra tu nhien.`);
+}
+
+// Endpoint kiem tra server hoat dong
 app.get("/ping", (req, res) => {
-  res.status(200).send("Server is alive.");
+  res.status(200).send("SPX Silent Order Assistant is running.");
 });
 
+// Endpoint xac thuc Webhook voi Meta Facebook
 app.get("/webhook", (req, res) => {
-  console.log("[Webhook] Nhan duoc yeu cau xac thuc tu Facebook:", req.query);
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("[Webhook] Xac thuc thanh cong.");
+    console.log("[Webhook] Xac thuc thanh cong voi Facebook.");
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
   }
 });
 
+// Endpoint tiep nhan tin nhan tu Facebook Messenger
 app.post("/webhook", (req, res) => {
   const body = req.body;
 
@@ -48,31 +222,49 @@ app.post("/webhook", (req, res) => {
       if (!entry.messaging || entry.messaging.length === 0) return;
       const event = entry.messaging[0];
 
+      // TRUONG HOP 1: Tin nhan tu phia Shop gui cho khach (is_echo: true)
       if (event.message && event.message.is_echo) {
         const customerPsid = event.recipient.id;
-        if (!event.message.app_id) {
-          const pauseUntil = Date.now() + 5 * 60 * 1000;
-          humanTakeoverMap.set(customerPsid, pauseUntil);
-          console.log(`[Human Takeover] Tam dung bot cho ${customerPsid} trong 5 phut.`);
+        const text = event.message.text || "";
+
+        recordMessage(customerPsid, "Shop", text);
+
+        // Kiem tra nhan vien co go lenh #chot khong
+        if (/#chot\b|#chotdon\b|#lendon\b/i.test(text)) {
+          console.log(`[Trigger Manual] Nhan vien vua go lenh chot don cho khach ${customerPsid}`);
+          if (autoTriggerTimers.has(customerPsid)) {
+            clearTimeout(autoTriggerTimers.get(customerPsid));
+            autoTriggerTimers.delete(customerPsid);
+          }
+          processOrderCreation(customerPsid, "LENH_CHOT_TU_NHAN_VIEN", true);
         }
         return;
       }
 
+      // TRUONG HOP 2: Tin nhan tu phia Khach hang gui toi (!is_echo)
       if (event.message && !event.message.is_echo) {
-        const senderPsid = event.sender.id;
-        const pauseUntil = humanTakeoverMap.get(senderPsid);
-        if (pauseUntil) {
-          if (Date.now() < pauseUntil) {
-            console.log(`[Bot Ignored] Khach ${senderPsid} dang duoc nhan vien ho tro.`);
-            return;
-          } else {
-            humanTakeoverMap.delete(senderPsid);
-          }
-        }
-
+        const customerPsid = event.sender.id;
         const text = event.message.text || "";
-        const attachments = event.message.attachments || [];
-        queueMessageProcessing(senderPsid, text, attachments);
+
+        recordMessage(customerPsid, "Khách hàng", text);
+
+        // Kiem tra tu dong: Co SĐT va dia chi hay khong
+        if (containsPhoneAndAddress(customerPsid)) {
+          console.log(`[Trigger Auto Detect] Phat hien SDT va Dia chi tu khach ${customerPsid}. Dat hen gio xu ly...`);
+
+          // Xoa hen gio cu neu khach dang tiep tuc go
+          if (autoTriggerTimers.has(customerPsid)) {
+            clearTimeout(autoTriggerTimers.get(customerPsid));
+          }
+
+          // Cho 4 giay de khach nhan xong cac tin nhan lien tiep truoc khi quet
+          const timer = setTimeout(() => {
+            autoTriggerTimers.delete(customerPsid);
+            processOrderCreation(customerPsid, "TU_DONG_PHAT_HIEN_SDT_DIACHI", false);
+          }, 4000);
+
+          autoTriggerTimers.set(customerPsid, timer);
+        }
       }
     });
   } else {
@@ -80,176 +272,23 @@ app.post("/webhook", (req, res) => {
   }
 });
 
-function queueMessageProcessing(senderPsid, text, attachments) {
-  sendSenderAction(senderPsid, "typing_on");
-
-  if (!messageBuffers.has(senderPsid)) {
-    messageBuffers.set(senderPsid, { texts: [], attachments: [], timer: null });
-  }
-
-  const buffer = messageBuffers.get(senderPsid);
-  if (text) buffer.texts.push(text);
-  if (attachments.length > 0) buffer.attachments.push(...attachments);
-
-  if (buffer.timer) clearTimeout(buffer.timer);
-
-  buffer.timer = setTimeout(async () => {
-    const combinedText = buffer.texts.join("\n");
-    const combinedAttachments = buffer.attachments;
-    messageBuffers.delete(senderPsid);
-
-    try {
-      await processChatWithGemini(senderPsid, combinedText, combinedAttachments);
-    } catch (error) {
-      const errDetail = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-      console.error(`[Gemini Error] PSID=${senderPsid} | Status=${error.response?.status || 'N/A'} | Detail: ${errDetail}`);
-      await sendSenderAction(senderPsid, "typing_off");
-      await sendFbMessage(senderPsid, { text: "Xin lỗi bạn, hệ thống đang bận hoặc gặp lỗi kết nối. Bạn vui lòng thử lại sau nhé! 🌸" });
-    }
-  }, 2500);
-}
-
-async function getCatalog() {
-  const now = Date.now();
-  if (!productCatalogCache || now - lastCatalogFetchTime > 5 * 60 * 1000) {
-    try {
-      const res = await axios.get(SHEET_CSV_URL, { timeout: 10000 });
-      productCatalogCache = res.data;
-      lastCatalogFetchTime = now;
-      console.log("[Catalog] Da cap nhat cache tu Google Sheets.");
-    } catch (err) {
-      console.error("[Catalog] Khong tai duoc du lieu Sheet:", err.message);
-    }
-  }
-  return productCatalogCache;
-}
-
-async function callGeminiWithRetry(payload, retries = MAX_RETRIES) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const response = await axios.post(url, payload, { timeout: GEMINI_TIMEOUT_MS });
-      return response;
-    } catch (err) {
-      const status = err.response?.status;
-      // Retry chi khi bi rate-limit (429) hoac server error (500, 503)
-      if ((status === 429 || status >= 500) && attempt < retries) {
-        const waitMs = Math.min(2000 * Math.pow(2, attempt), 15000); // 2s, 4s, 8s, max 15s
-        console.log(`[Gemini Retry] Attempt ${attempt + 1}/${retries} - Status ${status} - Wait ${waitMs}ms`);
-        await new Promise(resolve => setTimeout(resolve, waitMs));
-        continue;
-      }
-      throw err; // Re-throw neu het retry hoac loi khac
-    }
-  }
-}
-
-async function processChatWithGemini(senderPsid, text, attachments) {
-  const catalog = await getCatalog();
-  let userParts = [];
-
-  if (text) userParts.push({ text: text });
-
-  for (const item of attachments) {
-    if (item.type === "image" && item.payload && item.payload.url) {
-      try {
-        const imgRes = await axios.get(item.payload.url, { responseType: "arraybuffer", timeout: 10000 });
-        userParts.push({
-          inlineData: {
-            data: Buffer.from(imgRes.data).toString("base64"),
-            mimeType: "image/jpeg"
-          }
-        });
-        userParts.push({ text: "(Khach gui kem anh, doi chieu voi danh muc de tu van)" });
-      } catch (err) {
-        console.error("[Image] Loi tai anh:", err.message);
-      }
-    }
-  }
-
-  if (userParts.length === 0) return;
-
-  let historyData = conversationHistory.get(senderPsid) || { messages: [], lastUpdated: Date.now() };
-  let history = historyData.messages;
-  history.push({ role: "user", parts: userParts });
-
-  if (history.length > 8) history = history.slice(-8);
-
-  const systemInstruction = {
-    parts: [{
-      text: `Ban la tro ly tu van ban kep toc nhiet tinh, duyen dang cua tiem "Kep Xinh".
-Xung ho: Em - Chi. Dung emoji dang yeu (🌸, ✨, 🎀).
-Danh sach san pham:\n${catalog}
-
-Nguyen tac:
-1. Tu van ngan gon, ho tro chon theo chat toc va phong cach.
-2. Neu co anh san pham, chen link anh o CUOI CUNG: [IMAGE: url_anh].
-3. Neu khach gui anh, quan sat va doi chieu xem co mau tuong tu khong.`
-    }]
-  };
-
-  const geminiResponse = await callGeminiWithRetry({
-    contents: history,
-    system_instruction: systemInstruction
-  });
-
-  const candidates = geminiResponse.data.candidates;
-  if (!candidates || candidates.length === 0 || !candidates[0].content) {
-    console.error("[Gemini] Khong co candidates hop le:", JSON.stringify(geminiResponse.data));
-    throw new Error("Gemini returned no valid candidates");
-  }
-
-  const replyText = candidates[0].content.parts[0].text;
-  history.push({ role: "model", parts: [{ text: replyText }] });
-  conversationHistory.set(senderPsid, { messages: history, lastUpdated: Date.now() });
-
-  const imageMatch = replyText.match(/\[IMAGE:\s*(https?:\/\/[^\]]+)\]/);
-  const cleanText = replyText.replace(/\[IMAGE:\s*(https?:\/\/[^\]]+)\]/g, "").trim();
-
-  await sendSenderAction(senderPsid, "typing_off");
-  if (cleanText) {
-    await sendFbMessage(senderPsid, { text: cleanText });
-  }
-
-  if (imageMatch && imageMatch[1]) {
-    await sendFbMessage(senderPsid, {
-      attachment: {
-        type: "image",
-        payload: { url: imageMatch[1].trim(), is_reusable: true }
-      }
-    });
-  }
-}
-
-async function sendFbMessage(senderPsid, messagePayload) {
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      { recipient: { id: senderPsid }, message: messagePayload }
-    );
-  } catch (err) {
-    console.error("Loi gui tin nhan:", err.response?.data || err.message);
-  }
-}
-
-async function sendSenderAction(senderPsid, action) {
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      { recipient: { id: senderPsid }, sender_action: action }
-    );
-  } catch (err) {}
-}
-
+// Don dep dinh ky bo nho sau moi 30 phut (xoa hoi thoai khong hoat dong tren 2 tieng)
 setInterval(() => {
   const now = Date.now();
-  for (const [psid, data] of conversationHistory.entries()) {
-    if (now - data.lastUpdated > 30 * 60 * 1000) {
+  for (const [psid, history] of conversationHistory.entries()) {
+    if (history.length > 0 && now - history[history.length - 1].timestamp > 2 * 60 * 60 * 1000) {
       conversationHistory.delete(psid);
+      recentOrders.delete(psid);
+      autoTriggerTimers.delete(psid);
     }
   }
-}, 15 * 60 * 1000);
+}, 30 * 60 * 1000);
 
 app.listen(PORT, () => {
-  console.log(`Server dang chay tai cong ${PORT}`);
+  console.log(`==================================================`);
+  console.log(`🚀 Tro ly Tu dong Bat Don SPX Express dang chay tren cong ${PORT}`);
+  console.log(`- Che do: Im lang (Silent Mode) - Nguoi that chat`);
+  console.log(`- Kich hoat: Tu dong (SDT + Dia chi) HOAC Nhan vien go #chot`);
+  console.log(`- Xuat du lieu: Google Sheets theo chuan Mau Excel SPX`);
+  console.log(`==================================================`);
 });
