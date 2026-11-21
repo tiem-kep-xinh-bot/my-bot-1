@@ -63,3 +63,37 @@ Hằng ngày (hoặc trước mỗi ca lấy hàng của bưu tá SPX):
   *Ví dụ:* `"Dạ em cảm ơn chị nhiều ạ #chot"`, `"Chị chờ em xíu em đóng hàng gửi chị nha #chotdon"`.
 - Hệ thống sẽ tự động lọc bỏ chữ `#chot` và bóc tách các thông tin trước đó để lên đơn!
 
+---
+
+## V. HƯỚNG DẪN KẾT NỐI AHACHAT ĐỂ BẮT 100% KHÁCH NGOÀI
+
+### Bước 1: Liên kết Fanpage vào AhaChat
+1. Truy cập [https://ahachat.com](https://ahachat.com) $\rightarrow$ Đăng nhập bằng tài khoản Facebook quản trị Fanpage của bạn.
+2. Bấm **Tạo Bot mới** $\rightarrow$ Chọn Fanpage **Tiệm Kẹp Xinh** để kết nối.
+
+### Bước 2: Cài đặt Webhook chuyển tiếp sang server Render
+1. Trong màn hình quản lý bot trên AhaChat, nhìn menu bên trái chọn: **Cài đặt (Settings)** $\rightarrow$ **Tích hợp (Integrations)** (hoặc **API & Webhook**).
+2. Tìm mục **Webhook** $\rightarrow$ Bật kích hoạt:
+   - **URL Webhook:** `https://<ten-app-cua-ban>.onrender.com/ahachat-webhook`
+   *(Thay `<ten-app-cua-ban>.onrender.com` bằng đường dẫn Render của bạn)*
+   - Chọn gửi khi có: **Tin nhắn mới từ khách hàng (New user message)**.
+3. Bấm **Lưu (Save)**.
+
+*Hoặc cấu hình qua Kịch bản mặc định (Default Reply):*
+1. Vào **Kịch bản** $\rightarrow$ **Kịch bản mặc định**.
+2. Thêm khối **API / Webhook**:
+   - Method: `POST`
+   - URL: `https://<ten-app-cua-ban>.onrender.com/ahachat-webhook`
+   - Body JSON:
+     ```json
+     {
+       "id": "{{id}}",
+       "name": "{{name}}",
+       "text": "{{last_user_message}}"
+     }
+     ```
+3. Nối kịch bản vào khối API này và bấm Lưu.
+
+Từ lúc này, mọi khách lạ/khách ngoài nhắn tin vào Fanpage đều sẽ được AhaChat chuyển tiếp về server để Gemini bóc tách và tự động ghi vào Google Sheets!
+
+

@@ -197,6 +197,67 @@ app.get("/ping", (req, res) => {
   res.status(200).send("SPX Silent Order Assistant is running.");
 });
 
+// Endpoint tiep nhan tin nhan tu AhaChat Webhook (Ho tro 100% khach ngoai)
+app.get("/ahachat-webhook", (req, res) => {
+  res.status(200).send("AhaChat Webhook endpoint is ready.");
+});
+
+app.post("/ahachat-webhook", async (req, res) => {
+  try {
+    const body = req.body || {};
+    // Tra ve 200 OK ngay lap tuc de AhaChat khong bao loi timeout
+    res.status(200).json({ status: "success", message: "Event received" });
+
+    // Trich xuat thong tin linh hoat tu AhaChat payload
+    const customerId = String(body.id || body.user_id || body.psid || body.sender_id || body.chat_id || "ahachat_customer");
+    const text = String(body.text || body.message || body.last_user_message || body.last_input || body.content || "").trim();
+    const customerName = body.name || body.full_name || body.first_name || "Khách hàng";
+    const isShop = Boolean(body.is_shop || body.is_echo || body.sender === "shop");
+
+    if (!text) {
+      console.log(`[AhaChat Webhook] Nhan event tu ${customerId} nhung khong co text.`);
+      return;
+    }
+
+    console.log(`[AhaChat Webhook] Tin nhan tu ${isShop ? 'Shop' : customerName} (${customerId}): "${text}"`);
+
+    // TRUONG HOP 1: Nhan vien hoac shop go lenh #chot
+    if (isShop || /#chot\b|#chotdon\b|#lendon\b/i.test(text)) {
+      recordMessage(customerId, isShop ? "Shop" : "Khách hàng", text);
+      if (/#chot\b|#chotdon\b|#lendon\b/i.test(text)) {
+        console.log(`[AhaChat Trigger] Phat hien lenh chot don cho khach ${customerId}`);
+        if (autoTriggerTimers.has(customerId)) {
+          clearTimeout(autoTriggerTimers.get(customerId));
+          autoTriggerTimers.delete(customerId);
+        }
+        await processOrderCreation(customerId, "AHACHAT_LENH_CHOT", true);
+        return;
+      }
+    }
+
+    // TRUONG HOP 2: Khach hang gui tin nhan
+    recordMessage(customerId, "Khách hàng", text);
+
+    // Kiem tra tu dong: Co SĐT va dia chi hay khong
+    if (containsPhoneAndAddress(customerId)) {
+      console.log(`[AhaChat Auto Detect] Phat hien SDT va Dia chi tu khach ${customerId}. Dat hen gio xu ly...`);
+
+      if (autoTriggerTimers.has(customerId)) {
+        clearTimeout(autoTriggerTimers.get(customerId));
+      }
+
+      const timer = setTimeout(() => {
+        autoTriggerTimers.delete(customerId);
+        processOrderCreation(customerId, "AHACHAT_AUTO_DETECT", false);
+      }, 4000);
+
+      autoTriggerTimers.set(customerId, timer);
+    }
+  } catch (err) {
+    console.error("[AhaChat Webhook Error] Loi xu ly event:", err.message);
+  }
+});
+
 // Endpoint xac thuc Webhook voi Meta Facebook
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
